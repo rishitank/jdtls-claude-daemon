@@ -19,9 +19,15 @@ Patches 'initialize' to inject classFileContentsSupport and Maven source
 download settings so goToDefinition works for external JARs without any
 manual user steps across all Java codebases.
 
-Intercepts goToDefinition responses containing jdt:// URIs: calls
-java/classFileContents, writes the decompiled class to a temp file, and
-rewrites the URI to file:// before forwarding to the client.
+Intercepts definition/references responses containing jdt:// URIs: fans
+out java/classFileContents requests (one per unique URI), writes the
+decompiled class to a temp file, and rewrites ALL URIs to file:// before
+forwarding — handles multi-location responses (e.g. go-to-references
+returning several external-JAR locations) correctly.
+
+Server-initiated requests (workspace/applyEdit, window/showMessageRequest,
+etc.) sent while no client is connected receive a null response so jdtls
+is never left blocked on an unanswered request.
 
 Auto-restarts jdtls if the process dies: clears cached capabilities and
 pending state, spawns a new process, and resumes serving clients.
@@ -29,9 +35,9 @@ pending state, spawns a new process, and resumes serving clients.
 Per-connection write lock: prevents interleaved LSP frames when
 handle_client and _jdtls_to_client write to the same socket concurrently.
 
-Pending classFileContents GC: entries that receive no response within
-PENDING_TIMEOUT seconds are expired — the original response is forwarded
-with the jdt:// URI intact so the client is never silently hung.
+Pending classFileContents GC: groups that receive no response within
+PENDING_TIMEOUT seconds are expired — partial rewrites are applied and the
+response is forwarded so the client is never silently hung.
 
 Send SIGUSR1 to clear the initialize cache and force a live patched
 initialize on the next client connection:
@@ -199,8 +205,10 @@ class JdtlsDaemon:
         # Internal request IDs start at 100000 to avoid collision with harness IDs.
         self._internal_counter = 0
         self._internal_lock = threading.Lock()
-        # pending_classfile: internal_id → {orig_msg, jdt_uri, created_at}
+        # _pending_classfile: internal_id → {group_id, jdt_uri}
+        # _pending_groups:    group_id → {orig_msg, pending: set[int], resolved: {uri: path}, created_at}
         self._pending_classfile = {}
+        self._pending_groups = {}
         self._pending_lock = threading.Lock()
         self._decompiled_cache = {}     # jdt_uri → file_path (session cache)
         # Protects concurrent writes to jdtls stdin.
@@ -257,22 +265,25 @@ class JdtlsDaemon:
             log(f"_patch_initialize error: {e}")
             return body
 
-    def _find_jdt_uri(self, result):
-        """Return the first jdt:// URI in a definition result, or None."""
+    def _collect_jdt_uris(self, result, found):
+        """Recursively collect all unique jdt:// URIs from a definition result."""
         if isinstance(result, dict):
             for key in ("uri", "targetUri"):
                 uri = result.get(key, "")
-                if uri.startswith("jdt://"):
-                    return uri
+                if isinstance(uri, str) and uri.startswith("jdt://"):
+                    found.add(uri)
         elif isinstance(result, list):
             for item in result:
-                found = self._find_jdt_uri(item)
-                if found:
-                    return found
-        return None
+                self._collect_jdt_uris(item, found)
+
+    def _find_all_jdt_uris(self, result):
+        """Return a deduplicated list of all jdt:// URIs in a definition result."""
+        found = set()
+        self._collect_jdt_uris(result, found)
+        return list(found)
 
     def _rewrite_uri_in_result(self, result, old_uri, file_path):
-        """Replace old_uri with a file:// URI pointing to file_path, in place."""
+        """Replace every occurrence of old_uri with a file:// URI, in place."""
         new_uri = "file://" + urllib.parse.quote(file_path, safe="/")
         if isinstance(result, dict):
             for key in ("uri", "targetUri"):
@@ -317,10 +328,12 @@ class JdtlsDaemon:
         self._jdtls_initialized = False
         self.init_event.clear()
         with self._pending_lock:
-            count = len(self._pending_classfile)
+            classfile_count = len(self._pending_classfile)
+            group_count = len(self._pending_groups)
             self._pending_classfile.clear()
-        if count:
-            log(f"dropped {count} pending classFileContents (jdtls died)")
+            self._pending_groups.clear()
+        if classfile_count or group_count:
+            log(f"dropped {classfile_count} pending classFileContents, {group_count} groups (jdtls died)")
         self.start_jdtls()
 
     # ── Pending GC ──────────────────────────────────────────────────────
@@ -331,22 +344,29 @@ class JdtlsDaemon:
 
     def _gc_pending_classfile(self):
         """
-        Background thread: expire classFileContents entries older than
-        PENDING_TIMEOUT and forward the original (unrewritten) response so the
-        client is never silently hung waiting for a hold that will never resolve.
+        Background thread: expire classFileContents groups older than
+        PENDING_TIMEOUT.  Applies any partial rewrites already resolved
+        and forwards the response so the client is never silently hung.
         """
         while True:
             time.sleep(5.0)
             now = time.time()
             expired = []
             with self._pending_lock:
-                for req_id, entry in list(self._pending_classfile.items()):
-                    if now - entry.get("created_at", now) > PENDING_TIMEOUT:
-                        expired.append((req_id, entry))
-                        del self._pending_classfile[req_id]
-            for req_id, entry in expired:
-                log(f"classFileContents id={req_id} timed out — forwarding original response unmodified")
-                orig_msg = entry["orig_msg"]
+                for group_id, group in list(self._pending_groups.items()):
+                    if now - group.get("created_at", now) > PENDING_TIMEOUT:
+                        for iid in group["pending"]:
+                            self._pending_classfile.pop(iid, None)
+                        expired.append(group)
+                        del self._pending_groups[group_id]
+            for group in expired:
+                orig_msg = group["orig_msg"]
+                result = orig_msg.get("result")
+                for uri, path in group["resolved"].items():
+                    self._rewrite_uri_in_result(result, uri, path)
+                partial = len(group["resolved"])
+                total = partial + len(group["pending"])
+                log(f"classFileContents group timed out — forwarding with {partial}/{total} rewrites")
                 with self.client_lock:
                     sock = self.client_sock
                 if sock:
@@ -360,10 +380,12 @@ class JdtlsDaemon:
         currently connected client.  Also:
           - Detects the initialize response, caches it, fires init_event.
           - Intercepts java/classFileContents responses (internal requests)
-            and rewrites the held goToDefinition response before forwarding.
-          - Detects jdt:// URIs in definition responses, sends an internal
-            java/classFileContents request, and holds the response until the
-            decompiled content is ready.
+            and, once all URIs in a group are resolved, rewrites and forwards.
+          - Detects jdt:// URIs in definition/reference responses, fans out
+            classFileContents requests for each unique URI, and holds the
+            response until all decompiled content is ready.
+          - Sends a null response for server-initiated requests that arrive
+            while no client is connected so jdtls is never left blocked.
           - Calls _restart_jdtls on jdtls process death and exits so that
             the newly spawned reader thread takes over.
         """
@@ -381,26 +403,41 @@ class JdtlsDaemon:
             method, msg_id, msg = parse_method(body)
             log(f"jdtls→client: {method!r} id={msg_id}")
 
-            # ── Handle classFileContents response (internal request) ─────────────
+            # ── Handle classFileContents response (internal request) ──────────
             with self._pending_lock:
                 pending = self._pending_classfile.pop(msg_id, None)
 
             if pending is not None:
                 content = msg.get("result", "")
                 jdt_uri = pending["jdt_uri"]
+                group_id = pending["group_id"]
                 file_path = self._write_decompiled(jdt_uri, content)
                 self._decompiled_cache[jdt_uri] = file_path
-                orig_msg = pending["orig_msg"]
-                self._rewrite_uri_in_result(orig_msg.get("result"), jdt_uri, file_path)
-                body = json.dumps(orig_msg).encode()
-                log(f"rewrote jdt:// → file:// ({file_path})")
-                with self.client_lock:
-                    sock = self.client_sock
-                if sock:
-                    self._write_to_client(sock, body)
+
+                dispatch = None  # (orig_msg, resolved) once the whole group is done
+                with self._pending_lock:
+                    group = self._pending_groups.get(group_id)
+                    if group is not None:
+                        group["resolved"][jdt_uri] = file_path
+                        group["pending"].discard(msg_id)
+                        if not group["pending"]:
+                            dispatch = (group["orig_msg"], dict(group["resolved"]))
+                            del self._pending_groups[group_id]
+
+                if dispatch is not None:
+                    orig_msg, resolved = dispatch
+                    result = orig_msg.get("result")
+                    for uri, path in resolved.items():
+                        self._rewrite_uri_in_result(result, uri, path)
+                    body = json.dumps(orig_msg).encode()
+                    log(f"rewrote {len(resolved)} jdt:// URI(s) → file:// (group {group_id})")
+                    with self.client_lock:
+                        sock = self.client_sock
+                    if sock:
+                        self._write_to_client(sock, body)
                 continue
 
-            # ── Detect and cache the initialize response ───────────────────
+            # ── Detect and cache the initialize response ─────────────────────
             if (
                 self.init_capabilities is None
                 and self.init_expected_id is not None
@@ -415,42 +452,70 @@ class JdtlsDaemon:
                     log(f"initialize returned error: {msg.get('error')}")
                     self.init_event.set()
 
-            # ── Intercept jdt:// URIs in definition/implementation responses ──
+            # ── Intercept jdt:// URIs in definition/reference responses ───────
             if not method and msg_id is not None:
                 result = msg.get("result")
                 if result is not None:
-                    jdt_uri = self._find_jdt_uri(result)
-                    if jdt_uri:
-                        cached_path = self._decompiled_cache.get(jdt_uri)
-                        if cached_path:
-                            # Already decompiled this session — rewrite instantly.
-                            self._rewrite_uri_in_result(result, jdt_uri, cached_path)
+                    jdt_uris = self._find_all_jdt_uris(result)
+                    if jdt_uris:
+                        cached_resolutions = {}
+                        uncached = []
+                        for uri in jdt_uris:
+                            cached_path = self._decompiled_cache.get(uri)
+                            if cached_path:
+                                cached_resolutions[uri] = cached_path
+                            else:
+                                uncached.append(uri)
+
+                        if not uncached:
+                            # All cached — rewrite and fall through to forward.
+                            for uri, path in cached_resolutions.items():
+                                self._rewrite_uri_in_result(result, uri, path)
                             body = json.dumps(msg).encode()
-                            log(f"rewrote jdt:// → file:// (cached: {cached_path})")
+                            log(f"rewrote {len(cached_resolutions)} jdt:// URI(s) → file:// (all cached)")
                         else:
-                            # Request decompiled content from jdtls.
-                            internal_id = self._next_id()
+                            # Fan out classFileContents for each uncached URI.
+                            group_id = self._next_id()
+                            internal_entries = {self._next_id(): uri for uri in uncached}
                             with self._pending_lock:
-                                self._pending_classfile[internal_id] = {
+                                self._pending_groups[group_id] = {
                                     "orig_msg": msg,
-                                    "jdt_uri": jdt_uri,
+                                    "pending": set(internal_entries.keys()),
+                                    "resolved": cached_resolutions.copy(),
                                     "created_at": time.time(),
                                 }
-                            req = json.dumps({
-                                "jsonrpc": "2.0",
-                                "id": internal_id,
-                                "method": "java/classFileContents",
-                                "params": {"uri": jdt_uri},
-                            }).encode()
-                            log(f"classFileContents id={internal_id} uri={jdt_uri[:80]}")
-                            self._write_to_jdtls(req)
-                            continue  # Hold: forward only after content arrives
+                                for iid, uri in internal_entries.items():
+                                    self._pending_classfile[iid] = {
+                                        "group_id": group_id,
+                                        "jdt_uri": uri,
+                                    }
+                            for iid, uri in internal_entries.items():
+                                req = json.dumps({
+                                    "jsonrpc": "2.0",
+                                    "id": iid,
+                                    "method": "java/classFileContents",
+                                    "params": {"uri": uri},
+                                }).encode()
+                                log(f"classFileContents id={iid} uri={uri[:80]}")
+                                self._write_to_jdtls(req)
+                            continue  # Hold: forward only after all content arrives
 
-            # ── Forward to client ──────────────────────────────────────────────
+            # ── Forward to client ─────────────────────────────────────────────
             with self.client_lock:
                 sock = self.client_sock
             if sock:
                 self._write_to_client(sock, body)
+            elif method and msg_id is not None:
+                # Server-initiated request with no client connected — respond
+                # with null so jdtls is not left blocked (e.g.
+                # workspace/configuration, window/workDoneProgress/create).
+                null_resp = json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": None,
+                }).encode()
+                self._write_to_jdtls(null_resp)
+                log(f"no client for server request {method!r} id={msg_id} — sent null response")
 
     def handle_client(self, conn):
         """Handle one wrapper connection."""

@@ -9,6 +9,11 @@ sees this wrapper exit, so its maxRestarts counter is never consumed.
 Reads complete LSP frames from stdin before processing, ensuring the cached
 initialize frame is always a full, well-formed message even when the harness
 writes large payloads in multiple OS-level chunks.
+
+Buffers bytes received from the daemon socket and only forwards complete
+LSP frames to the harness, preventing frame corruption on large responses
+(e.g. workspace/symbol results, large completion payloads) that may arrive
+split across multiple recv() calls.
 """
 import json
 import os
@@ -157,6 +162,30 @@ def lsp_frame(body_bytes):
     return f"Content-Length: {len(body_bytes)}\r\n\r\n".encode() + body_bytes
 
 
+def flush_complete_frames(buf, stdout_fd):
+    """
+    Write all complete LSP frames from buf to stdout_fd.
+    Returns the remaining (incomplete) bytes.
+    """
+    while True:
+        sep = buf.find(b"\r\n\r\n")
+        if sep == -1:
+            break
+        content_length = None
+        for line in buf[:sep].split(b"\r\n"):
+            if line.lower().startswith(b"content-length:"):
+                content_length = int(line.split(b":", 1)[1].strip())
+                break
+        if content_length is None:
+            break
+        frame_end = sep + 4 + content_length
+        if len(buf) < frame_end:
+            break
+        os.write(stdout_fd, buf[:frame_end])
+        buf = buf[frame_end:]
+    return buf
+
+
 def connect_to_daemon():
     ensure_daemon()
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -178,6 +207,11 @@ def main():
     # complete frame regardless of how many OS chunks the harness used.
     harness_init_frame = None
     harness_init_id = None
+
+    # Accumulates raw bytes from the daemon socket; flushed frame-by-frame
+    # to stdout so large responses split across recv() calls are never
+    # forwarded as partial frames.
+    recv_buf = b""
 
     while True:
         r, _, _ = select.select([stdin_fd, sock_fd], [], [], 3600.0)
@@ -204,6 +238,7 @@ def main():
             if not data:
                 log("daemon socket closed — reconnecting")
                 sock.close()
+                recv_buf = b""  # discard any partial frame from the dead connection
                 sock = connect_to_daemon()
                 sock_fd = sock.fileno()
                 if harness_init_frame:
@@ -228,7 +263,8 @@ def main():
                             # Unparseable — discard to avoid confusing the harness.
                             break
                 continue
-            os.write(stdout_fd, data)
+            recv_buf += data
+            recv_buf = flush_complete_frames(recv_buf, stdout_fd)
 
     sock.close()
     log("wrapper done")
