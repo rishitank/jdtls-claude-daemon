@@ -1,0 +1,567 @@
+#!/usr/bin/env python3
+"""
+Persistent jdtls daemon.
+
+Holds one jdtls process alive indefinitely.  Wrapper scripts connect to
+/tmp/jdtls-daemon.sock, and the daemon bridges their session to jdtls.
+
+Intercepts 'shutdown' and 'exit' from the harness: sends fake success
+without forwarding to jdtls, so jdtls stays alive across harness resets.
+
+Caches the 'initialize' response: when the harness re-initializes (new
+session), the daemon replies with the cached capabilities immediately.
+
+Single-reader design: _jdtls_to_client is the ONLY thread that reads from
+jdtls stdout.  It detects the initialize response, caches it, and fires
+init_event so handle_client can unblock.  No data race.
+
+Patches 'initialize' to inject classFileContentsSupport and Maven source
+download settings so goToDefinition works for external JARs without any
+manual user steps across all Java codebases.
+
+Intercepts goToDefinition responses containing jdt:// URIs: calls
+java/classFileContents, writes the decompiled class to a temp file, and
+rewrites the URI to file:// before forwarding to the client.
+
+Auto-restarts jdtls if the process dies: clears cached capabilities and
+pending state, spawns a new process, and resumes serving clients.
+
+Per-connection write lock: prevents interleaved LSP frames when
+handle_client and _jdtls_to_client write to the same socket concurrently.
+
+Pending classFileContents GC: entries that receive no response within
+PENDING_TIMEOUT seconds are expired — the original response is forwarded
+with the jdt:// URI intact so the client is never silently hung.
+
+Send SIGUSR1 to clear the initialize cache and force a live patched
+initialize on the next client connection:
+  kill -USR1 $(cat /tmp/jdtls-daemon.pid)
+"""
+import hashlib
+import json
+import os
+import re
+import select
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+
+def _find_real_jdtls():
+    """
+    Locate the real jdtls binary, skipping the directory where this daemon
+    script lives (which contains the wrapper script named 'jdtls').
+    Respects the JDTLS_BIN environment variable as an override.
+    """
+    override = os.environ.get("JDTLS_BIN")
+    if override:
+        return override
+    my_dir = os.path.realpath(os.path.dirname(os.path.abspath(__file__)))
+    for path_dir in os.environ.get("PATH", "").split(os.pathsep):
+        if not path_dir:
+            continue
+        if os.path.realpath(path_dir) == my_dir:
+            continue    # skip our own directory — that's the wrapper, not jdtls
+        candidate = os.path.join(path_dir, "jdtls")
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return "jdtls"      # last resort: let execv search PATH
+
+
+REAL_JDTLS = _find_real_jdtls()
+DAEMON_SOCKET = "/tmp/jdtls-daemon.sock"
+DAEMON_PID_FILE = "/tmp/jdtls-daemon.pid"
+LOG_FILE = "/tmp/jdtls_daemon.log"
+DECOMPILED_DIR = "/tmp/jdtls-decompiled"
+PENDING_TIMEOUT = 30.0
+
+_log_fd = os.open(LOG_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+PID = os.getpid()
+
+
+def log(msg):
+    ts = time.strftime("%H:%M:%S.") + f"{int(time.time() * 1000) % 1000:03d}"
+    os.write(_log_fd, f"[{ts}][daemon {PID}] {msg}\n".encode())
+
+
+# ── LSP framing helpers ───────────────────────────────────────────────
+
+def read_header_line_sock(sock):
+    line = b""
+    while True:
+        ch = sock.recv(1)
+        if not ch:
+            return None
+        line += ch
+        if line.endswith(b"\r\n"):
+            return line[:-2]
+
+
+def read_lsp_from_sock(sock):
+    headers = {}
+    while True:
+        line = read_header_line_sock(sock)
+        if line is None:
+            return None
+        if line == b"":
+            break
+        if b":" in line:
+            k, _, v = line.partition(b":")
+            headers[k.strip().lower()] = v.strip()
+    length = int(headers.get(b"content-length", 0))
+    if length == 0:
+        return b""
+    body = b""
+    while len(body) < length:
+        chunk = sock.recv(length - len(body))
+        if not chunk:
+            return None
+        body += chunk
+    return body
+
+
+def read_header_line_fd(fd):
+    line = b""
+    while True:
+        ch = os.read(fd, 1)
+        if not ch:
+            return None
+        line += ch
+        if line.endswith(b"\r\n"):
+            return line[:-2]
+
+
+def read_lsp_from_fd(fd):
+    headers = {}
+    while True:
+        line = read_header_line_fd(fd)
+        if line is None:
+            return None
+        if line == b"":
+            break
+        if b":" in line:
+            k, _, v = line.partition(b":")
+            headers[k.strip().lower()] = v.strip()
+    length = int(headers.get(b"content-length", 0))
+    if length == 0:
+        return b""
+    body = b""
+    while len(body) < length:
+        chunk = os.read(fd, length - len(body))
+        if not chunk:
+            return None
+        body += chunk
+    return body
+
+
+def lsp_frame(body_bytes):
+    return f"Content-Length: {len(body_bytes)}\r\n\r\n".encode() + body_bytes
+
+
+def write_sock(sock, body_bytes):
+    sock.sendall(lsp_frame(body_bytes))
+
+
+def write_fd(fd, body_bytes):
+    os.write(fd, lsp_frame(body_bytes))
+
+
+def parse_method(body):
+    try:
+        msg = json.loads(body)
+        return msg.get("method", ""), msg.get("id"), msg
+    except Exception:
+        return "", None, {}
+
+
+# ── Main daemon logic ────────────────────────────────────────────────
+
+class JdtlsDaemon:
+    def __init__(self, jdtls_args):
+        self.jdtls_args = jdtls_args
+        self.jdtls_proc = None
+        self.jdtls_stdin_fd = None
+        self.jdtls_stdout_fd = None
+        self.init_capabilities = None   # cached initialize response body
+        self._jdtls_initialized = False  # True once 'initialized' was forwarded
+        self.jdtls_lock = threading.Lock()
+        self.client_sock = None         # current connected wrapper socket
+        self.client_lock = threading.Lock()
+        # Serialises all writes to client_sock from any thread.
+        # Prevents interleaved LSP frames when handle_client (fake shutdown,
+        # cached initialize) and _jdtls_to_client write concurrently.
+        self.client_write_lock = threading.Lock()
+        self.init_event = threading.Event()
+        self.init_expected_id = None    # id of the in-flight initialize request
+        # Internal request IDs start at 100000 to avoid collision with harness IDs.
+        self._internal_counter = 0
+        self._internal_lock = threading.Lock()
+        # pending_classfile: internal_id → {orig_msg, jdt_uri, created_at}
+        self._pending_classfile = {}
+        self._pending_lock = threading.Lock()
+        self._decompiled_cache = {}     # jdt_uri → file_path (session cache)
+        # Protects concurrent writes to jdtls stdin.
+        self._stdin_lock = threading.Lock()
+
+    # ── Internal helpers ──────────────────────────────────────────────────
+
+    def _next_id(self):
+        with self._internal_lock:
+            self._internal_counter += 1
+            return 100000 + self._internal_counter
+
+    def _write_to_jdtls(self, body_bytes):
+        with self._stdin_lock:
+            write_fd(self.jdtls_stdin_fd, body_bytes)
+
+    def _write_to_client(self, sock, body_bytes):
+        """Thread-safe write to a client socket."""
+        with self.client_write_lock:
+            try:
+                write_sock(sock, body_bytes)
+            except Exception as e:
+                log(f"write to client failed: {e}")
+
+    def _patch_initialize(self, body, msg):
+        """
+        Inject settings into the initialize request before forwarding to jdtls:
+          - extendedClientCapabilities.classFileContentsSupport = true
+            so jdtls returns jdt:// URIs for classes without attached sources
+            instead of null, enabling the decompilation fallback below.
+          - java.maven.downloadSources = true
+            so jdtls downloads -sources.jar files during Maven project import,
+            making goToDefinition return real file:// URIs for library classes.
+          - java.maven.downloadJavadoc = true
+            for hover documentation on library classes.
+        """
+        try:
+            params = msg.setdefault("params", {})
+            opts = params.setdefault("initializationOptions", {})
+
+            caps = opts.setdefault("extendedClientCapabilities", {})
+            caps["classFileContentsSupport"] = True
+
+            settings = opts.setdefault("settings", {})
+            java_settings = settings.setdefault("java", {})
+            maven = java_settings.setdefault("maven", {})
+            maven["downloadSources"] = True
+            maven["downloadJavadoc"] = True
+
+            patched = json.dumps(msg).encode()
+            log("patched initialize: classFileContentsSupport=true, downloadSources=true")
+            return patched
+        except Exception as e:
+            log(f"_patch_initialize error: {e}")
+            return body
+
+    def _find_jdt_uri(self, result):
+        """Return the first jdt:// URI in a definition result, or None."""
+        if isinstance(result, dict):
+            for key in ("uri", "targetUri"):
+                uri = result.get(key, "")
+                if uri.startswith("jdt://"):
+                    return uri
+        elif isinstance(result, list):
+            for item in result:
+                found = self._find_jdt_uri(item)
+                if found:
+                    return found
+        return None
+
+    def _rewrite_uri_in_result(self, result, old_uri, file_path):
+        """Replace old_uri with a file:// URI pointing to file_path, in place."""
+        new_uri = "file://" + urllib.parse.quote(file_path, safe="/")
+        if isinstance(result, dict):
+            for key in ("uri", "targetUri"):
+                if result.get(key) == old_uri:
+                    result[key] = new_uri
+        elif isinstance(result, list):
+            for item in result:
+                self._rewrite_uri_in_result(item, old_uri, file_path)
+
+    def _write_decompiled(self, jdt_uri, content):
+        """Write decompiled content to a temp file and return the path."""
+        os.makedirs(DECOMPILED_DIR, exist_ok=True)
+        m = re.search(r"/([^/?]+\.class)", jdt_uri)
+        class_name = m.group(1).replace(".class", ".java") if m else "Unknown.java"
+        uri_hash = hashlib.md5(jdt_uri.encode()).hexdigest()[:8]
+        path = os.path.join(DECOMPILED_DIR, f"{uri_hash}_{class_name}")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content or "// decompiled source not available\n")
+        log(f"wrote decompiled source: {path}")
+        return path
+
+    # ── jdtls lifecycle ──────────────────────────────────────────────────
+
+    def start_jdtls(self):
+        log(f"spawning jdtls args={self.jdtls_args}")
+        self.jdtls_proc = subprocess.Popen(
+            [REAL_JDTLS] + self.jdtls_args,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=open(LOG_FILE + ".jdtls.err", "w"),
+        )
+        self.jdtls_stdin_fd = self.jdtls_proc.stdin.fileno()
+        self.jdtls_stdout_fd = self.jdtls_proc.stdout.fileno()
+        log(f"jdtls PID={self.jdtls_proc.pid}")
+        t = threading.Thread(target=self._jdtls_to_client, daemon=True)
+        t.start()
+
+    def _restart_jdtls(self):
+        """Clear state and restart jdtls after death. Called from _jdtls_to_client."""
+        log("restarting jdtls after death")
+        self.init_capabilities = None
+        self._jdtls_initialized = False
+        self.init_event.clear()
+        with self._pending_lock:
+            count = len(self._pending_classfile)
+            self._pending_classfile.clear()
+        if count:
+            log(f"dropped {count} pending classFileContents (jdtls died)")
+        self.start_jdtls()
+
+    # ── Pending GC ──────────────────────────────────────────────────────
+
+    def start_pending_gc(self):
+        t = threading.Thread(target=self._gc_pending_classfile, daemon=True)
+        t.start()
+
+    def _gc_pending_classfile(self):
+        """
+        Background thread: expire classFileContents entries older than
+        PENDING_TIMEOUT and forward the original (unrewritten) response so the
+        client is never silently hung waiting for a hold that will never resolve.
+        """
+        while True:
+            time.sleep(5.0)
+            now = time.time()
+            expired = []
+            with self._pending_lock:
+                for req_id, entry in list(self._pending_classfile.items()):
+                    if now - entry.get("created_at", now) > PENDING_TIMEOUT:
+                        expired.append((req_id, entry))
+                        del self._pending_classfile[req_id]
+            for req_id, entry in expired:
+                log(f"classFileContents id={req_id} timed out — forwarding original response unmodified")
+                orig_msg = entry["orig_msg"]
+                with self.client_lock:
+                    sock = self.client_sock
+                if sock:
+                    self._write_to_client(sock, json.dumps(orig_msg).encode())
+
+    # ── jdtls I/O ─────────────────────────────────────────────────────────
+
+    def _jdtls_to_client(self):
+        """
+        Single reader of jdtls stdout.  Forwards every message to the
+        currently connected client.  Also:
+          - Detects the initialize response, caches it, fires init_event.
+          - Intercepts java/classFileContents responses (internal requests)
+            and rewrites the held goToDefinition response before forwarding.
+          - Detects jdt:// URIs in definition responses, sends an internal
+            java/classFileContents request, and holds the response until the
+            decompiled content is ready.
+          - Calls _restart_jdtls on jdtls process death and exits so that
+            the newly spawned reader thread takes over.
+        """
+        while True:
+            r, _, _ = select.select([self.jdtls_stdout_fd], [], [], 60.0)
+            if not r:
+                log("jdtls stdout quiet 60s")
+                continue
+            body = read_lsp_from_fd(self.jdtls_stdout_fd)
+            if body is None:
+                log("jdtls stdout EOF — jdtls died")
+                self._restart_jdtls()
+                return   # new reader thread started by _restart_jdtls → start_jdtls
+
+            method, msg_id, msg = parse_method(body)
+            log(f"jdtls→client: {method!r} id={msg_id}")
+
+            # ── Handle classFileContents response (internal request) ─────────────
+            with self._pending_lock:
+                pending = self._pending_classfile.pop(msg_id, None)
+
+            if pending is not None:
+                content = msg.get("result", "")
+                jdt_uri = pending["jdt_uri"]
+                file_path = self._write_decompiled(jdt_uri, content)
+                self._decompiled_cache[jdt_uri] = file_path
+                orig_msg = pending["orig_msg"]
+                self._rewrite_uri_in_result(orig_msg.get("result"), jdt_uri, file_path)
+                body = json.dumps(orig_msg).encode()
+                log(f"rewrote jdt:// → file:// ({file_path})")
+                with self.client_lock:
+                    sock = self.client_sock
+                if sock:
+                    self._write_to_client(sock, body)
+                continue
+
+            # ── Detect and cache the initialize response ───────────────────
+            if (
+                self.init_capabilities is None
+                and self.init_expected_id is not None
+                and msg_id == self.init_expected_id
+                and method == ""
+            ):
+                if "result" in msg:
+                    self.init_capabilities = body
+                    log("cached initialize capabilities")
+                    self.init_event.set()
+                elif "error" in msg:
+                    log(f"initialize returned error: {msg.get('error')}")
+                    self.init_event.set()
+
+            # ── Intercept jdt:// URIs in definition/implementation responses ──
+            if not method and msg_id is not None:
+                result = msg.get("result")
+                if result is not None:
+                    jdt_uri = self._find_jdt_uri(result)
+                    if jdt_uri:
+                        cached_path = self._decompiled_cache.get(jdt_uri)
+                        if cached_path:
+                            # Already decompiled this session — rewrite instantly.
+                            self._rewrite_uri_in_result(result, jdt_uri, cached_path)
+                            body = json.dumps(msg).encode()
+                            log(f"rewrote jdt:// → file:// (cached: {cached_path})")
+                        else:
+                            # Request decompiled content from jdtls.
+                            internal_id = self._next_id()
+                            with self._pending_lock:
+                                self._pending_classfile[internal_id] = {
+                                    "orig_msg": msg,
+                                    "jdt_uri": jdt_uri,
+                                    "created_at": time.time(),
+                                }
+                            req = json.dumps({
+                                "jsonrpc": "2.0",
+                                "id": internal_id,
+                                "method": "java/classFileContents",
+                                "params": {"uri": jdt_uri},
+                            }).encode()
+                            log(f"classFileContents id={internal_id} uri={jdt_uri[:80]}")
+                            self._write_to_jdtls(req)
+                            continue  # Hold: forward only after content arrives
+
+            # ── Forward to client ──────────────────────────────────────────────
+            with self.client_lock:
+                sock = self.client_sock
+            if sock:
+                self._write_to_client(sock, body)
+
+    def handle_client(self, conn):
+        """Handle one wrapper connection."""
+        with self.client_lock:
+            self.client_sock = conn
+        log("client connected")
+        try:
+            while True:
+                body = read_lsp_from_sock(conn)
+                if body is None:
+                    log("client disconnected")
+                    break
+                method, msg_id, msg = parse_method(body)
+                log(f"client→daemon: {method!r} id={msg_id} len={len(body)}")
+
+                if method == "initialize":
+                    if self.init_capabilities is not None:
+                        # Rewrite the cached response's id to match this client's
+                        # initialize request id, since every session may use a
+                        # different id and the client will reject a mismatched one.
+                        try:
+                            cached_msg = json.loads(self.init_capabilities)
+                            cached_msg["id"] = msg_id
+                            replay_body = json.dumps(cached_msg).encode()
+                        except Exception:
+                            replay_body = self.init_capabilities
+                        log("replaying cached initialize response")
+                        self._write_to_client(conn, replay_body)
+                    else:
+                        log("forwarding initialize to jdtls")
+                        patched = self._patch_initialize(body, msg)
+                        self.init_expected_id = msg_id
+                        self.init_event.clear()
+                        self._write_to_jdtls(patched)
+                        # Block until _jdtls_to_client fires the event.
+                        # Response was already forwarded to client by
+                        # _jdtls_to_client — nothing more to do here.
+                        if not self.init_event.wait(timeout=120.0):
+                            log("timeout waiting for jdtls initialize response")
+
+                elif method == "initialized":
+                    if not self._jdtls_initialized:
+                        # Forward exactly once per jdtls lifetime so jdtls can
+                        # finish its workspace-scan startup sequence.
+                        self._write_to_jdtls(body)
+                        self._jdtls_initialized = True
+                    else:
+                        log("ignoring duplicate initialized notification")
+
+                elif method == "shutdown":
+                    # Always fake success — never forward shutdown to jdtls.
+                    if msg_id is not None:
+                        fake = json.dumps({
+                            "jsonrpc": "2.0",
+                            "id": msg_id,
+                            "result": None
+                        }).encode()
+                        self._write_to_client(conn, fake)
+                        log(f"sent fake shutdown success id={msg_id}")
+
+                elif method == "exit":
+                    log("ignoring exit notification")
+
+                else:
+                    self._write_to_jdtls(body)
+
+        except Exception as e:
+            log(f"client handler error: {e}")
+        finally:
+            with self.client_lock:
+                if self.client_sock is conn:
+                    self.client_sock = None
+            try:
+                conn.close()
+            except Exception:
+                pass
+            log("client handler done")
+
+
+def run_daemon(jdtls_args):
+    with open(DAEMON_PID_FILE, "w") as f:
+        f.write(str(PID))
+
+    try:
+        os.unlink(DAEMON_SOCKET)
+    except FileNotFoundError:
+        pass
+
+    daemon = JdtlsDaemon(jdtls_args)
+    daemon.start_jdtls()
+    daemon.start_pending_gc()
+
+    def _clear_cache(signum, frame):
+        log("SIGUSR1: clearing initialize cache")
+        daemon.init_capabilities = None
+        daemon.init_event.clear()
+        daemon._jdtls_initialized = False
+
+    signal.signal(signal.SIGUSR1, _clear_cache)
+
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(DAEMON_SOCKET)
+    server.listen(5)
+    os.chmod(DAEMON_SOCKET, 0o600)
+    log(f"listening on {DAEMON_SOCKET}")
+
+    while True:
+        conn, _ = server.accept()
+        t = threading.Thread(target=daemon.handle_client, args=(conn,), daemon=True)
+        t.start()
+
+
+if __name__ == "__main__":
+    run_daemon(sys.argv[1:])

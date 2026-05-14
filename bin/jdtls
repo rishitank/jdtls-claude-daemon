@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""
+Daemon-delegating wrapper with full bidirectional message logging.
+Logs both directions: harness→daemon (stdin) and daemon→harness (stdout).
+
+Reconnects transparently when the daemon is restarted: the harness never
+sees this wrapper exit, so its maxRestarts counter is never consumed.
+
+Reads complete LSP frames from stdin before processing, ensuring the cached
+initialize frame is always a full, well-formed message even when the harness
+writes large payloads in multiple OS-level chunks.
+"""
+import json
+import os
+import select
+import socket
+import sys
+import time
+
+DAEMON_SOCKET = "/tmp/jdtls-daemon.sock"
+DAEMON_PID_FILE = "/tmp/jdtls-daemon.pid"
+DAEMON_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jdtls-daemon")
+LOG_FILE = "/tmp/jdtls_wrapper.log"
+
+_log_fd = os.open(LOG_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+PID = os.getpid()
+
+
+def log(msg):
+    ts = time.strftime("%H:%M:%S.") + f"{int(time.time() * 1000) % 1000:03d}"
+    os.write(_log_fd, f"[{ts}][wrapper {PID}] {msg}\n".encode())
+
+
+def parse_method(body):
+    try:
+        msg = json.loads(body)
+        return msg.get("method", ""), msg.get("id"), msg
+    except Exception:
+        return "", None, {}
+
+
+def daemon_is_alive():
+    try:
+        with open(DAEMON_PID_FILE) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+def daemon_socket_ready():
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(1.0)
+        s.connect(DAEMON_SOCKET)
+        s.close()
+        return True
+    except Exception:
+        return False
+
+
+def start_daemon():
+    log("starting daemon")
+    pid = os.fork()
+    if pid != 0:
+        os.waitpid(pid, 0)
+        return
+    os.setsid()
+    pid2 = os.fork()
+    if pid2 != 0:
+        os._exit(0)
+    devnull = os.open("/dev/null", os.O_RDWR)
+    os.dup2(devnull, 0)
+    os.dup2(devnull, 1)
+    err_log = os.open("/tmp/jdtls_daemon_stderr.log",
+                      os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    os.dup2(err_log, 2)
+    os.execv(DAEMON_BIN, [DAEMON_BIN] + sys.argv[1:])
+
+
+def ensure_daemon():
+    if daemon_is_alive() and daemon_socket_ready():
+        log("daemon already running")
+        return
+    log("starting daemon...")
+    start_daemon()
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        if daemon_socket_ready():
+            log("daemon ready")
+            return
+        time.sleep(0.2)
+    log("ERROR: daemon socket timeout")
+    sys.exit(1)
+
+
+def read_lsp_frame_from_sock(sock):
+    """Read exactly one complete LSP frame from a socket; return body bytes."""
+    headers = {}
+    while True:
+        line = b""
+        while True:
+            ch = sock.recv(1)
+            if not ch:
+                return None
+            line += ch
+            if line.endswith(b"\r\n"):
+                line = line[:-2]
+                break
+        if not line:
+            break
+        if b":" in line:
+            k, _, v = line.partition(b":")
+            headers[k.strip().lower()] = v.strip()
+    length = int(headers.get(b"content-length", 0))
+    body = b""
+    while len(body) < length:
+        chunk = sock.recv(length - len(body))
+        if not chunk:
+            return None
+        body += chunk
+    return body
+
+
+def read_lsp_frame_from_fd(fd):
+    """Read exactly one complete LSP frame from a file descriptor; return body bytes."""
+    headers = {}
+    while True:
+        line = b""
+        while True:
+            ch = os.read(fd, 1)
+            if not ch:
+                return None
+            line += ch
+            if line.endswith(b"\r\n"):
+                line = line[:-2]
+                break
+        if line == b"":
+            break
+        if b":" in line:
+            k, _, v = line.partition(b":")
+            headers[k.strip().lower()] = v.strip()
+    length = int(headers.get(b"content-length", 0))
+    if length == 0:
+        return b""
+    body = b""
+    while len(body) < length:
+        chunk = os.read(fd, length - len(body))
+        if not chunk:
+            return None
+        body += chunk
+    return body
+
+
+def lsp_frame(body_bytes):
+    return f"Content-Length: {len(body_bytes)}\r\n\r\n".encode() + body_bytes
+
+
+def connect_to_daemon():
+    ensure_daemon()
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(DAEMON_SOCKET)
+    log("connected to daemon")
+    return sock
+
+
+def main():
+    log(f"=== wrapper started args={sys.argv[1:]}")
+    sock = connect_to_daemon()
+
+    stdin_fd = sys.stdin.fileno()
+    stdout_fd = sys.stdout.fileno()
+    sock_fd = sock.fileno()
+
+    # Cached framed initialize message for reconnect replay.
+    # Built by re-serialising the parsed JSON so it is always a single
+    # complete frame regardless of how many OS chunks the harness used.
+    harness_init_frame = None
+    harness_init_id = None
+
+    while True:
+        r, _, _ = select.select([stdin_fd, sock_fd], [], [], 3600.0)
+        if not r:
+            log("idle 3600s, exiting")
+            break
+        if stdin_fd in r:
+            body = read_lsp_frame_from_fd(stdin_fd)
+            if body is None:
+                log("stdin EOF")
+                break
+            method, msg_id, msg = parse_method(body)
+            log(f"harness→daemon: method={method!r} id={msg_id} len={len(body)}")
+            if harness_init_frame is None and method == "initialize":
+                # Re-serialise from the parsed object so the cached frame is
+                # always exactly one well-formed LSP message, even if the
+                # original arrived split across multiple OS reads.
+                harness_init_frame = lsp_frame(json.dumps(msg).encode())
+                harness_init_id = msg_id
+                log(f"cached initialize frame for reconnect (id={msg_id})")
+            sock.sendall(lsp_frame(body))
+        if sock_fd in r:
+            data = sock.recv(65536)
+            if not data:
+                log("daemon socket closed — reconnecting")
+                sock.close()
+                sock = connect_to_daemon()
+                sock_fd = sock.fileno()
+                if harness_init_frame:
+                    log("replaying initialize to new daemon")
+                    sock.sendall(harness_init_frame)
+                    # Discard frames until we see the response to our initialize.
+                    # Any notifications that arrive before the response are
+                    # forwarded to the harness so they are not silently dropped.
+                    while True:
+                        resp_body = read_lsp_frame_from_sock(sock)
+                        if resp_body is None:
+                            break
+                        try:
+                            resp_msg = json.loads(resp_body)
+                            if resp_msg.get("id") == harness_init_id:
+                                log(f"discarded initialize response (id={harness_init_id})")
+                                break
+                            # Notification or response for a different id — forward it.
+                            log(f"forwarding pre-init message: method={resp_msg.get('method')!r}")
+                            os.write(stdout_fd, lsp_frame(resp_body))
+                        except Exception:
+                            # Unparseable — discard to avoid confusing the harness.
+                            break
+                continue
+            os.write(stdout_fd, data)
+
+    sock.close()
+    log("wrapper done")
+
+
+if __name__ == "__main__":
+    main()
