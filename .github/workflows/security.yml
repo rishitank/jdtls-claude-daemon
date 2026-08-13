@@ -1,0 +1,24 @@
+# There is no package manifest here, so ecosystem is `none` and the native
+# audit step is skipped. osv-scanner and gitleaks still run and block.
+name: security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "43 4 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  security:
+    uses: rishitank/.github/.github/workflows/security.yml@v1
+    with:
+      ecosystem: none

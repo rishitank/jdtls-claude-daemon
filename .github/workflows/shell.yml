@@ -1,0 +1,64 @@
+# shellcheck over the shell entrypoints.
+#
+# `bin/jdtls` and `bin/jdtls-daemon` have no extension, so files are discovered
+# by shebang as well as by suffix. This is the first time anything has checked
+# them, so the job is non-blocking for now — remove `continue-on-error` once the
+# backlog is clear, otherwise this is decoration rather than a gate.
+name: shell
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: shell-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Install shellcheck
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends shellcheck
+          shellcheck --version
+
+      - name: Discover shell scripts
+        id: find
+        run: |
+          set -euo pipefail
+          : > /tmp/scripts.txt
+          while IFS= read -r -d '' f; do
+            case "$f" in
+              *.sh|*.bash) echo "$f" >> /tmp/scripts.txt ;;
+              *)
+                # Extensionless entrypoints are found by shebang.
+                if head -c 2 "$f" 2>/dev/null | grep -q '#!' \
+                   && head -n 1 "$f" | grep -qE '(ba|da|k|z)?sh'; then
+                  echo "$f" >> /tmp/scripts.txt
+                fi
+                ;;
+            esac
+          done < <(find . -type f -not -path './.git/*' -print0)
+          count=$(wc -l < /tmp/scripts.txt)
+          echo "count=${count}" >> "$GITHUB_OUTPUT"
+          echo "Found ${count} shell script(s):"
+          cat /tmp/scripts.txt
+
+      - name: Run shellcheck
+        if: steps.find.outputs.count != '0'
+        continue-on-error: true
+        run: xargs -r -a /tmp/scripts.txt shellcheck --color=always --severity=warning
