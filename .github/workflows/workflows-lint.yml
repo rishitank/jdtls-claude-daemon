@@ -1,0 +1,17 @@
+# actionlint over this repo's workflows.
+name: workflows-lint
+
+on:
+  pull_request:
+    paths: [".github/workflows/**"]
+  push:
+    branches: [main]
+    paths: [".github/workflows/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    uses: rishitank/.github/.github/workflows/workflows-lint.yml@v1
